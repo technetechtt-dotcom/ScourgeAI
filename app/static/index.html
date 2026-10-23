@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ScourgeAI | Operator console</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e7eefa;background:#0c1322}
+*{box-sizing:border-box}
+body{margin:0}
+a:focus,button:focus,input:focus,select:focus,textarea:focus{outline:3px solid #8ec5ff;outline-offset:2px}
+header{background:#111d33;padding:16px 20px;border-bottom:1px solid #2f4058}
+header b{font-size:20px}
+.banner{margin:12px 0 0;padding:10px 12px;border-left:4px solid #efa952;color:#f3d7a6}
+nav{display:flex;flex-wrap:wrap;gap:8px;padding:12px 20px;background:#0e1a2e;border-bottom:1px solid #2f4058}
+nav button[aria-current="page"]{background:#1663b3}
+main{max-width:1180px;margin:0 auto;padding:20px}
+h1{font-size:24px;margin:0 0 8px}
+h2{font-size:18px}
+.sub,.empty{color:#aabbd0}
+.panel,article{background:#17253c;border:1px solid #2d425e;border-radius:12px;padding:16px;margin:12px 0}
+.controls,.auth{display:flex;flex-wrap:wrap;gap:8px;align-items:end}
+label{display:flex;flex-direction:column;gap:4px;font-size:14px}
+input,select,button,textarea{padding:10px;border-radius:7px;border:1px solid #455e7e;background:#0d1a2e;color:#f1f5fb;font:inherit}
+button{background:#2475ce;cursor:pointer}
+button:hover{background:#1663b3}
+button.secondary{background:#1d334d}
+textarea{width:100%;min-height:80px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #2d425e;vertical-align:top}
+.scroll{overflow-x:auto}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.stat strong{display:block;font-size:26px;margin-top:6px}
+#status,#connection{min-height:1.2em}
+.error{color:#ffb4b4}
+.ok{color:#b7f0c8}
+dl{display:grid;grid-template-columns:minmax(140px,220px) 1fr;gap:8px 12px}
+dt{color:#aabbd0}
+dd{margin:0}
+@media(max-width:800px){
+  .stats,dl{grid-template-columns:1fr}
+  main{padding:14px}
+  table{font-size:13px}
+}
+</style>
+</head>
+<body>
+<a href="#content">Skip to content</a>
+<header>
+  <b>SCOURGE<span style="color:#6fb7ff">AI</span></b>
+  <p class="banner">NOT A LIVE EMERGENCY SYSTEM. Stored records from this database. Not a live emergency picture and not simulated filler. This console does not dispatch responders or immobilise vehicles.</p>
+</header>
+<nav aria-label="Primary">
+  <button type="button" data-view="overview">Overview</button>
+  <button type="button" data-view="incidents">Live Incidents</button>
+  <button type="button" data-view="guardian">Guardian Intelligence</button>
+  <button type="button" data-view="arxvigil">ArxVigil Intelligence</button>
+  <button type="button" data-view="detail">Incident Details</button>
+  <button type="button" data-view="timeline">Incident Timeline</button>
+  <button type="button" data-view="investigations">AI Investigations</button>
+  <button type="button" data-view="devices">Device Health</button>
+  <button type="button" data-view="evidence">Evidence Management</button>
+  <button type="button" data-view="recommendations">AI Recommendations</button>
+  <button type="button" data-view="models">Model Registry</button>
+  <button type="button" data-view="monitoring">System Monitoring</button>
+  <button type="button" data-view="audit">Audit Logs</button>
+  <button type="button" data-view="organisation">Organisation and User Management</button>
+  <button type="button" data-view="maintenance">Platform maintenance</button>
+</nav>
+<main id="content">
+  <section class="panel auth" aria-label="Access">
+    <label>Tenant ID<input id="tenant" value="demo" autocomplete="organization"/></label>
+    <label>Product
+      <select id="product">
+        <option value="guardian">Guardian AI</option>
+        <option value="arxvigil">ArxVigil AI</option>
+      </select>
+    </label>
+    <label>Development client secret<input id="secret" type="password" autocomplete="off"/></label>
+    <button type="button" id="use-secret" class="secondary">Use client secret</button>
+    <label>Email<input id="email" type="email" autocomplete="username"/></label>
+    <label>Password<input id="password" type="password" autocomplete="current-password"/></label>
+    <button type="button" id="login">Sign in</button>
+    <button type="button" id="logout" class="secondary">Sign out</button>
+    <p class="sub" style="flex:1 0 100%">Demo password correct-horse-battery. Tenant ID demo: operator@example.com, supervisor@example.com, admin@example.com, developer@example.com (full access and platform maintenance). Tenant ID field: field.operator@example.com.</p>
+  </section>
+  <p id="connection" class="sub" role="status">Not connected. Sign in or provide a development client secret.</p>
+  <p id="status" role="status"></p>
+  <h1 id="title">Overview</h1>
+  <div id="view" aria-live="polite"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const state = {token:'', secret:'', role:'', view:'overview', selected:'', failures:0, timer:0, stream:null};
+const LIVE = new Set(['overview','incidents','guardian','arxvigil','devices','monitoring','audit','recommendations','maintenance']);
+const CAN_REVIEW = new Set(['supervisor','administrator','developer','service']);
+const CAN_STATUS = new Set(['supervisor','administrator','developer']);
+const CAN_ACCOUNTS = new Set(['administrator','developer']);
+const TITLES = {
+  overview:'Overview', incidents:'Live Incidents', guardian:'Guardian Intelligence', arxvigil:'ArxVigil Intelligence',
+  detail:'Incident Details', timeline:'Incident Timeline', investigations:'AI Investigations', devices:'Device Health',
+  evidence:'Evidence Management', recommendations:'AI Recommendations', models:'Model Registry',
+  monitoring:'System Monitoring', audit:'Audit Logs', organisation:'Organisation and User Management',
+  maintenance:'Platform maintenance'
+};
+
+function el(tag, text, attrs){
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (attrs) Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+  return node;
+}
+function query(){
+  return new URLSearchParams({tenant_id:$('tenant').value.trim(), product:$('product').value});
+}
+async function api(path, options={}){
+  const headers = Object.assign({'Content-Type':'application/json'}, options.headers || {});
+  if (state.token) headers.Authorization = 'Bearer ' + state.token;
+  else if (state.secret) headers['X-Client-Secret'] = state.secret;
+  const response = await fetch(path, {method:options.method || 'GET', headers, body:options.body ? JSON.stringify(options.body) : undefined, cache:'no-store'});
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = {detail:text}; }
+  if (!response.ok){
+    const detail = body && body.detail ? (typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)) : response.statusText;
+    throw new Error('HTTP ' + response.status + ': ' + detail);
+  }
+  return body;
+}
+function setStatus(message, bad){
+  $('status').textContent = message || '';
+  $('status').className = bad ? 'error' : '';
+}
+function table(headers, rows){
+  const wrap = el('div', null, {'class':'scroll'});
+  const t = document.createElement('table');
+  const head = document.createElement('tr');
+  headers.forEach((header) => head.appendChild(el('th', header)));
+  const thead = document.createElement('thead');
+  thead.appendChild(head);
+  const body = document.createElement('tbody');
+  if (!rows.length){
+    const tr = document.createElement('tr');
+    const td = el('td', 'Nothing stored for this tenant and product.');
+    td.colSpan = headers.length;
+    tr.appendChild(td);
+    body.appendChild(tr);
+  } else {
+    rows.forEach((cells) => {
+      const tr = document.createElement('tr');
+      cells.forEach((value) => tr.appendChild(el('td', value == null || value === '' ? '—' : String(value))));
+      body.appendChild(tr);
+    });
+  }
+  t.appendChild(thead);
+  t.appendChild(body);
+  wrap.appendChild(t);
+  return wrap;
+}
+function stats(items){
+  const wrap = el('div', null, {'class':'stats'});
+  items.forEach(([label, value]) => {
+    const card = el('article');
+    card.appendChild(el('span', label, {'class':'sub'}));
+    card.appendChild(el('strong', value == null ? '—' : String(value)));
+    wrap.appendChild(card);
+  });
+  return wrap;
+}
+function requireAuth(){
+  if (!state.token && !state.secret) throw new Error('Sign in or enter a development client secret first.');
+}
+async function incidentRows(){
+  requireAuth();
+  const items = await api('/v1/incidents?' + query());
+  const wrap = document.createElement('div');
+  wrap.appendChild(el('p', 'Select a stored incident. Counts below are calculated from this response.', {'class':'sub'}));
+  wrap.appendChild(stats([
+    ['Incidents', items.length],
+    ['Emergency', items.filter((item) => item.severity === 'EMERGENCY').length],
+    ['High risk', items.filter((item) => item.severity === 'HIGH_RISK').length]
+  ]));
+  const list = table(['Subject','Type','Severity','Status','Incident','Action'], items.map((item) => [item.subject_id, item.incident_type, item.severity, item.status, item.id, '']));
+  list.querySelectorAll('tbody tr').forEach((tr, index) => {
+    if (!items[index]) return;
+    const open = el('button', 'Open incident', {type:'button'});
+    open.addEventListener('click', () => { state.selected = items[index].id; show('detail'); });
+    const cell = tr.lastElementChild;
+    cell.replaceChildren(open);
+  });
+  wrap.appendChild(list);
+  if (!items.length) wrap.appendChild(el('p', 'No incidents stored for this tenant and product.', {'class':'empty'}));
+  return wrap;
+}
+async function renderOverview(){
+  requireAuth();
+  const summary = await api('/v1/ops/summary?' + query());
+  const monitor = await api('/v1/monitoring?' + query());
+  const wrap = document.createElement('div');
+  wrap.appendChild(el('p', 'Counts are stored records for the selected tenant and product.', {'class':'sub'}));
+  const counts = summary.counts || {};
+  wrap.appendChild(stats([['Incidents', counts.incidents], ['Emergency', counts.emergency], ['Open', counts.open]]));
+  wrap.appendChild(el('p', 'Live dispatch: ' + monitor.live_dispatch + '. Language model: ' + monitor.llm_enabled + '. Worker enabled: ' + monitor.worker_enabled + '.'));
+  wrap.appendChild(el('p', 'Outbox pending: ' + monitor.outbox_pending + '. Dead letters: ' + monitor.dead_letters + '. Database: ' + monitor.database + '.'));
+  return wrap;
+}
+async function renderDetail(){
+  requireAuth();
+  const wrap = document.createElement('div');
+  if (!state.selected){
+    wrap.appendChild(el('p', 'Select an incident from Live Incidents.', {'class':'empty'}));
+    return wrap;
+  }
+  const detail = await api('/v1/incidents/' + encodeURIComponent(state.selected) + '?' + query());
+  const brief = await api('/v1/incidents/' + encodeURIComponent(state.selected) + '/brief?' + query());
+  const article = el('article');
+  article.appendChild(el('h2', brief.headline || 'Incident'));
+  article.appendChild(el('p', brief.summary || ''));
+  article.appendChild(el('p', 'Template: ' + brief.generated_by + '. Language model enabled: ' + brief.llm_enabled + '.', {'class':'sub'}));
+  const facts = el('div');
+  facts.appendChild(el('h2', 'Known facts'));
+  (brief.known_facts || []).forEach((fact) => facts.appendChild(el('p', JSON.stringify(fact))));
+  if (!(brief.known_facts || []).length) facts.appendChild(el('p', 'No facts stored.', {'class':'empty'}));
+  const predictions = el('div');
+  predictions.appendChild(el('h2', 'Predictions'));
+  (brief.predictions || []).forEach((item) => predictions.appendChild(el('p', typeof item === 'string' ? item : JSON.stringify(item))));
+  article.appendChild(facts);
+  article.appendChild(predictions);
+  wrap.appendChild(article);
+  const form = el('form');
+  form.appendChild(el('h2', 'Ask about this incident'));
+  const area = el('textarea');
+  area.required = true;
+  area.setAttribute('aria-label', 'Incident question');
+  form.appendChild(area);
+  form.appendChild(el('button', 'Ask', {type:'submit'}));
+  const answer = el('p');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      const result = await api('/v1/incidents/' + encodeURIComponent(state.selected) + '/questions?' + query(), {method:'POST', body:{question:area.value}});
+      answer.textContent = (result.grounded ? 'Sourced answer. ' : 'Not grounded. ') + result.answer;
+    } catch (error) { answer.textContent = error.message; }
+  });
+  form.appendChild(answer);
+  wrap.appendChild(form);
+  wrap.appendChild(el('p', 'Recommendations on this incident: ' + (detail.recommendations || []).length, {'class':'sub'}));
+  if (CAN_STATUS.has(state.role)){
+    const statusForm = el('form');
+    statusForm.appendChild(el('h2', 'Incident status'));
+    statusForm.appendChild(el('p', 'Closing or reviewing an incident records the change. It does not dispatch or command a vehicle.', {'class':'sub'}));
+    const status = document.createElement('select');
+    status.setAttribute('aria-label', 'Incident status');
+    ['OPEN','IN_REVIEW','CLOSED'].forEach((value) => status.appendChild(el('option', value, {value})));
+    status.value = (detail.incident && detail.incident.status) || 'OPEN';
+    const note = el('input', null, {type:'text', 'aria-label':'Status note', maxlength:'2000'});
+    statusForm.appendChild(status);
+    statusForm.appendChild(note);
+    statusForm.appendChild(el('button', 'Update status', {type:'submit'}));
+    statusForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        const result = await api('/v1/incidents/' + encodeURIComponent(state.selected) + '/status?' + query(), {method:'POST', body:{status:status.value, note:note.value}});
+        setStatus('Status ' + result.status + '. Action executed: ' + result.action_executed);
+        show('detail');
+      } catch (error) { setStatus(error.message, true); }
+    });
+    wrap.appendChild(statusForm);
+  }
+  return wrap;
+}
+async function renderTimeline(){
+  requireAuth();
+  const wrap = document.createElement('div');
+  if (!state.selected){ wrap.appendChild(el('p', 'Select an incident from Live Incidents.', {'class':'empty'})); return wrap; }
+  const timeline = await api('/v1/incidents/' + encodeURIComponent(state.selected) + '/timeline?' + query());
+  wrap.appendChild(table(['When','Type','Payload hash','Delayed','Device signature'], (timeline.events || []).map((event) => [event.occurred_at, event.type, event.payload_sha256, event.delayed, event.device_signature_verified])));
+  return wrap;
+}
+async function renderInvestigations(){
+  requireAuth();
+  const wrap = document.createElement('div');
+  const catalogue = await api('/v1/agents?' + query());
+  wrap.appendChild(el('h2', 'Agents'));
+  wrap.appendChild(table(['Agent','Tools','Forbidden actions'], catalogue.map((agent) => [agent.name, (agent.allowed_tools || []).join(', '), (agent.forbidden_actions || []).join(', ')])));
+  const path = '/v1/agents/executions?' + query() + (state.selected ? '&incident_id=' + encodeURIComponent(state.selected) : '');
+  const rows = await api(path);
+  wrap.appendChild(el('h2', 'Executions'));
+  wrap.appendChild(table(['Agent','Status','Confidence','Error'], rows.map((row) => [row.agent_name, row.status, row.confidence, row.error || ''])));
+  return wrap;
+}
+async function renderDevices(){
+  requireAuth();
+  const rows = await api('/v1/devices?' + query());
+  return table(['Device','Role','Backup observation','Power','Quality','Backend activation'], rows.map((row) => [row.device_id, row.tracker_role, row.backup_observation, row.power_state, row.data_quality, row.activated_by_backend]));
+}
+async function renderEvidence(){
+  requireAuth();
+  const path = '/v1/evidence?' + query() + (state.selected ? '&incident_id=' + encodeURIComponent(state.selected) : '');
+  const rows = await api(path);
+  const wrap = document.createElement('div');
+  wrap.appendChild(el('p', 'Evidence rows are append-only. There is no edit or delete control.', {'class':'sub'}));
+  wrap.appendChild(table(['Label','Event','SHA-256','Mutable'], rows.map((row) => [row.label, row.event_id, row.sha256, row.mutable])));
+  return wrap;
+}
+async function renderRecommendations(){
+  requireAuth();
+  const rows = await api('/v1/recommendations?' + query());
+  const wrap = document.createElement('div');
+  wrap.appendChild(el('p', 'Accept and reject record a human decision. They do not dispatch or command a vehicle.', {'class':'sub'}));
+  if (!CAN_REVIEW.has(state.role)) wrap.appendChild(el('p', 'Review requires a supervisor, administrator, or developer session.', {'class':'empty'}));
+  if (!rows.length) wrap.appendChild(el('p', 'No recommendations stored for this tenant and product.', {'class':'empty'}));
+  rows.forEach((row) => {
+    const card = el('article');
+    card.appendChild(el('p', row.action));
+    card.appendChild(el('p', 'Status: ' + row.status + (row.reviewed_by ? ' by ' + row.reviewed_by : ''), {'class':'sub'}));
+    if (row.status === 'PENDING' && CAN_REVIEW.has(state.role)){
+      ['ACCEPTED','REJECTED'].forEach((decision) => {
+        const button = el('button', decision === 'ACCEPTED' ? 'Accept' : 'Reject', {type:'button'});
+        button.addEventListener('click', async () => {
+          try {
+            const result = await api('/v1/recommendations/' + encodeURIComponent(row.id) + '/review?' + query(), {method:'POST', body:{status:decision, reviewer:'console-operator', note:'Recorded from the operator console'}});
+            setStatus('Recorded ' + result.status + '. Action executed: ' + result.action_executed);
+            show('recommendations');
+          } catch (error) { setStatus(error.message, true); }
+        });
+        card.appendChild(button);
+      });
+    }
+    wrap.appendChild(card);
+  });
+  return wrap;
+}
+async function renderModels(){
+  requireAuth();
+  const rows = await api('/v1/models?' + query());
+  return table(['Name','Version','Kind','LLM','Description'], rows.map((row) => [row.name, row.version, row.kind, row.llm, row.description]));
+}
+async function renderMonitoring(){
+  requireAuth();
+  const row = await api('/v1/monitoring?' + query());
+  const wrap = document.createElement('div');
+  wrap.appendChild(stats([
+    ['Outbox pending', row.outbox_pending],
+    ['Dead letters', row.dead_letters],
+    ['Database', row.database]
+  ]));
+  wrap.appendChild(el('p', 'Version ' + row.version + '. Worker enabled: ' + row.worker_enabled + '. Live dispatch: ' + row.live_dispatch + '. Language model: ' + row.llm_enabled + '.'));
+  wrap.appendChild(el('p', 'Prometheus text is exposed at /metrics for this process.', {'class':'sub'}));
+  return wrap;
+}
+async function renderAudit(){
+  requireAuth();
+  const rows = await api('/v1/audit?' + query());
+  return table(['When','Actor','Action','Subject'], rows.map((row) => [row.created_at, row.actor, row.action, row.subject]));
+}
+async function renderOrganisation(){
+  requireAuth();
+  const wrap = document.createElement('div');
+  const me = await api('/v1/auth/me?' + query());
+  wrap.appendChild(el('p', 'Signed in as ' + me.actor + ' (' + me.role + ', ' + me.method + ').'));
+  if (!CAN_ACCOUNTS.has(me.role)){
+    wrap.appendChild(el('p', 'User management requires an administrator or developer session.', {'class':'empty'}));
+    return wrap;
+  }
+  const org = await api('/v1/organisations?' + query());
+  wrap.appendChild(el('h2', org.name));
+  const people = await api('/v1/users?' + query());
+  wrap.appendChild(table(['Email','Role','MFA','Disabled'], people.map((person) => [person.email, person.role, person.mfa_enabled, person.disabled])));
+  const form = el('form');
+  form.appendChild(el('h2', 'Create user'));
+  const email = el('input', null, {type:'email', required:'', 'aria-label':'New user email'});
+  const password = el('input', null, {type:'password', required:'', minlength:'12', 'aria-label':'New user password'});
+  const role = document.createElement('select');
+  role.setAttribute('aria-label', 'Role');
+  ['operator','supervisor','administrator','developer','service'].forEach((value) => role.appendChild(el('option', value, {value})));
+  form.appendChild(email); form.appendChild(password); form.appendChild(role);
+  form.appendChild(el('button', 'Create user', {type:'submit'}));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      await api('/v1/users?' + query(), {method:'POST', body:{email:email.value, password:password.value, role:role.value}});
+      setStatus('User created.');
+      show('organisation');
+    } catch (error) { setStatus(error.message, true); }
+  });
+  wrap.appendChild(form);
+  const others = people.filter((person) => person.email !== me.actor);
+  if (others.length){
+    const update = el('form');
+    update.appendChild(el('h2', 'Update account'));
+    const who = document.createElement('select');
+    who.setAttribute('aria-label', 'Account');
+    others.forEach((person) => who.appendChild(el('option', person.email, {value:person.id})));
+    const nextRole = document.createElement('select');
+    nextRole.setAttribute('aria-label', 'Updated role');
+    ['operator','supervisor','administrator','developer','service'].forEach((value) => nextRole.appendChild(el('option', value, {value})));
+    const disabled = document.createElement('input');
+    disabled.type = 'checkbox';
+    disabled.setAttribute('aria-label', 'Disabled');
+    update.appendChild(who);
+    update.appendChild(nextRole);
+    update.appendChild(disabled);
+    update.appendChild(el('button', 'Update account', {type:'submit'}));
+    who.addEventListener('change', () => {
+      const selected = others.find((person) => person.id === who.value);
+      if (!selected) return;
+      nextRole.value = selected.role;
+      disabled.checked = !!selected.disabled;
+    });
+    who.dispatchEvent(new Event('change'));
+    update.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        await api('/v1/users/' + encodeURIComponent(who.value) + '?' + query(), {method:'POST', body:{role:nextRole.value, disabled:disabled.checked}});
+        setStatus('Account updated.');
+        show('organisation');
+      } catch (error) { setStatus(error.message, true); }
+    });
+    wrap.appendChild(update);
+  }
+  return wrap;
+}
+async function renderMaintenance(){
+  requireAuth();
+  const wrap = document.createElement('div');
+  const me = await api('/v1/auth/me?' + query());
+  if (me.role !== 'developer'){
+    wrap.appendChild(el('p', 'Platform maintenance and updates require the developer account.', {'class':'empty'}));
+    return wrap;
+  }
+  const row = await api('/v1/maintenance?' + query());
+  wrap.appendChild(el('p', 'These actions update platform records for this organisation. They do not dispatch responders, immobilise a vehicle, edit evidence, or enable a language model.', {'class':'sub'}));
+  wrap.appendChild(stats([
+    ['Version', row.version],
+    ['Models', row.model_count],
+    ['Outbox pending', row.outbox_pending],
+    ['Dead letters', row.dead_letters]
+  ]));
+  wrap.appendChild(el('p', 'Database: ' + row.database + '. Worker enabled: ' + row.worker_enabled + '. Live dispatch: ' + row.live_dispatch + '. Language model: ' + row.llm_enabled + '.'));
+  const refresh = el('button', 'Refresh model catalogue', {type:'button'});
+  refresh.addEventListener('click', async () => {
+    try {
+      const result = await api('/v1/maintenance/catalogue?' + query(), {method:'POST', body:{}});
+      setStatus('Catalogue refresh added ' + result.created + ' model rows. Dispatch: ' + result.external_dispatch);
+      show('maintenance');
+    } catch (error) { setStatus(error.message, true); }
+  });
+  const requeue = el('button', 'Requeue dead letters', {type:'button'});
+  requeue.addEventListener('click', async () => {
+    try {
+      const result = await api('/v1/maintenance/requeue?' + query(), {method:'POST', body:{}});
+      setStatus('Requeued ' + result.requeued + '. Dispatch: ' + result.external_dispatch);
+      show('maintenance');
+    } catch (error) { setStatus(error.message, true); }
+  });
+  wrap.appendChild(refresh);
+  wrap.appendChild(requeue);
+  const form = el('form');
+  form.appendChild(el('h2', 'Register or update a model'));
+  const name = el('input', null, {required:'', 'aria-label':'Model name', maxlength:'120'});
+  const version = el('input', null, {required:'', 'aria-label':'Model version', maxlength:'50'});
+  const kind = document.createElement('select');
+  kind.setAttribute('aria-label', 'Model kind');
+  ['rules','template','agent'].forEach((value) => kind.appendChild(el('option', value, {value})));
+  const status = document.createElement('select');
+  status.setAttribute('aria-label', 'Model status');
+  ['active','retired'].forEach((value) => status.appendChild(el('option', value, {value})));
+  const description = el('input', null, {required:'', 'aria-label':'Model description', maxlength:'500'});
+  form.appendChild(name); form.appendChild(version); form.appendChild(kind); form.appendChild(status); form.appendChild(description);
+  form.appendChild(el('button', 'Save model', {type:'submit'}));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      const result = await api('/v1/maintenance/models?' + query(), {method:'POST', body:{name:name.value, version:version.value, kind:kind.value, status:status.value, description:description.value}});
+      setStatus((result.created ? 'Registered ' : 'Updated ') + result.name + ' ' + result.version + '. Language model: ' + result.llm);
+      show('maintenance');
+    } catch (error) { setStatus(error.message, true); }
+  });
+  wrap.appendChild(form);
+  return wrap;
+}
+const LOADERS = {
+  overview: renderOverview,
+  incidents: incidentRows,
+  guardian: incidentRows,
+  arxvigil: incidentRows,
+  detail: renderDetail,
+  timeline: renderTimeline,
+  investigations: renderInvestigations,
+  devices: renderDevices,
+  evidence: renderEvidence,
+  recommendations: renderRecommendations,
+  models: renderModels,
+  monitoring: renderMonitoring,
+  audit: renderAudit,
+  organisation: renderOrganisation,
+  maintenance: renderMaintenance
+};
+async function show(view){
+  state.view = view;
+  if (view === 'guardian') $('product').value = 'guardian';
+  if (view === 'arxvigil') $('product').value = 'arxvigil';
+  document.querySelectorAll('nav button').forEach((button) => {
+    if (button.dataset.view === view) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
+  $('title').textContent = TITLES[view];
+  const host = $('view');
+  host.replaceChildren(el('p', 'Loading…', {'class':'sub'}));
+  try {
+    host.replaceChildren(await LOADERS[view]());
+    setStatus('');
+    $('connection').textContent = 'Push feed connected.';
+    $('connection').className = 'ok';
+    state.failures = 0;
+  } catch (error) {
+    host.replaceChildren(el('p', error.message, {'class':'error'}));
+    setStatus(error.message, true);
+    const signedIn = Boolean(state.token || state.secret);
+    $('connection').textContent = (signedIn ? 'Reconnecting… ' : 'Not connected. ') + error.message;
+    $('connection').className = signedIn ? 'error' : '';
+    if (signedIn) state.failures += 1;
+  }
+}
+function connectStream(){
+  if (state.stream) state.stream.abort();
+  if (!state.token && !state.secret) return;
+  const controller = new AbortController();
+  state.stream = controller;
+  const headers = {};
+  if (state.token) headers.Authorization = 'Bearer ' + state.token;
+  else headers['X-Client-Secret'] = state.secret;
+  fetch('/v1/stream?' + query(), {headers, signal: controller.signal, cache: 'no-store'}).then(async (response) => {
+    if (!response.ok || !response.body) throw new Error('HTTP ' + response.status);
+    $('connection').textContent = 'Push feed connected.';
+    $('connection').className = 'ok';
+    state.failures = 0;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, {stream: true});
+      if (!buffer.includes('\n\n')) continue;
+      buffer = '';
+      if (LIVE.has(state.view)) await show(state.view);
+    }
+    throw new Error('Push feed closed');
+  }).catch((error) => {
+    if (error.name === 'AbortError') return;
+    state.failures += 1;
+    $('connection').textContent = 'Reconnecting push feed… ' + error.message;
+    $('connection').className = 'error';
+    const wait = Math.min(30000, 2000 * Math.min(state.failures, 4));
+    state.timer = window.setTimeout(connectStream, wait);
+  });
+}
+document.querySelectorAll('nav button').forEach((button) => button.addEventListener('click', () => show(button.dataset.view)));
+$('use-secret').addEventListener('click', () => {
+  state.secret = $('secret').value;
+  state.token = '';
+  state.role = 'service';
+  show(state.view);
+  connectStream();
+});
+$('login').addEventListener('click', async () => {
+  const organisation = $('tenant').value.trim();
+  const email = $('email').value.trim();
+  const password = $('password').value.trim();
+  if (!organisation || email.length < 3) {
+    setStatus('Enter the organisation and a full email address.', true);
+    return;
+  }
+  if (password.length < 12) {
+    setStatus('Password must be at least 12 characters. The demo password is correct-horse-battery.', true);
+    return;
+  }
+  try {
+    const result = await api('/v1/auth/login', {method:'POST', body:{organisation_id:organisation, email, password}});
+    state.token = result.access_token;
+    state.secret = '';
+    state.role = result.role;
+    $('tenant').value = result.organisation_id;
+    show('overview');
+    connectStream();
+  } catch (error) { setStatus(error.message, true); }
+});
+$('logout').addEventListener('click', async () => {
+  try { if (state.token) await api('/v1/auth/logout', {method:'POST'}); } catch (error) { setStatus(error.message, true); }
+  if (state.stream) state.stream.abort();
+  state.token = '';
+  state.secret = '';
+  state.role = '';
+  $('connection').textContent = 'Signed out.';
+  $('view').replaceChildren(el('p', 'Sign in to load stored records.', {'class':'empty'}));
+});
+show('overview');
+</script>
+</body>
+</html>
