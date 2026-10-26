@@ -48,6 +48,10 @@ class User(Base):
     role = Column(String(32), nullable=False)
     mfa_secret = Column(Text, nullable=True)
     mfa_enabled = Column(Boolean, nullable=False, default=False)
+    recovery_hashes = Column(Text, nullable=True)
+    failed_attempts = Column(Integer, nullable=False, default=0)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+    last_login_host = Column(String(120), nullable=True)
     disabled = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
     __table_args__ = (
@@ -67,6 +71,17 @@ class SessionToken(Base):
     scope = Column(String(32), nullable=False, default="full")
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    client_host = Column(String(120), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=now, nullable=False)
+
+
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+    id = Column(String(60), primary_key=True)
+    user_id = Column(String(60), ForeignKey("users.id"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
 

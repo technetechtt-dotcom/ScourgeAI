@@ -15,7 +15,7 @@ def send(event_id,product,event_type,subject='person-1',tenant='tenant-a',secret
     ts=str(int(time.time()))
     secret=secret if secret is not None else ('secret-guardian' if product=='guardian' else 'secret-arx')
     sig=hmac.new(secret.encode(),ts.encode()+b'.'+body,hashlib.sha256).hexdigest()
-    return client.post('/v1/events',content=body,headers={'X-Event-Timestamp':ts,'X-Event-Signature':sig,'Content-Type':'application/json'})
+    return client.post('/v1/events',content=body,headers={'X-Event-Timestamp':ts,'X-Event-Signature':sig,'X-Event-Nonce':event_id,'Content-Type':'application/json'})
 
 def test_health():
     assert client.get('/health').json()['live_dispatch'] is False

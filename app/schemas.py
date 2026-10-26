@@ -32,6 +32,7 @@ class LoginIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=12, max_length=200)
     totp: str | None = None
+    recovery_code: str | None = None
 
     @field_validator("organisation_id", "email", "password", mode="before")
     @classmethod
@@ -40,7 +41,7 @@ class LoginIn(BaseModel):
             return value.strip()
         return value
 
-    @field_validator("totp", mode="before")
+    @field_validator("totp", "recovery_code", mode="before")
     @classmethod
     def blank_code_is_missing(cls, value):
         if not isinstance(value, str):
@@ -51,6 +52,11 @@ class LoginIn(BaseModel):
 class MfaConfirmIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
     code: str = Field(min_length=6, max_length=6)
+
+class PasswordResetIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    token: str = Field(min_length=20, max_length=200)
+    password: str = Field(min_length=12, max_length=200)
 
 class UserCreateIn(BaseModel):
     model_config = ConfigDict(extra='forbid')

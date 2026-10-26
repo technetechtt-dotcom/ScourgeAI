@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -72,6 +73,11 @@ def ingest_event(
             raise HTTPException(409, "Event ID conflict")
         increment("scourgeai_events_duplicate_total")
         return {"duplicate": True, "event_id": existing.id, "incident_id": existing.incident_id}
+    if not nonce or not str(nonce).strip():
+        raise HTTPException(422, "Nonce required")
+    production = os.environ.get("TIC_ENV", "development") == "production"
+    if (production or os.environ.get("TIC_REQUIRE_DEVICE_SIGNATURE") == "1") and not device_verified:
+        raise HTTPException(401, "Device signature required")
     if nonce:
         try:
             with db.begin_nested():

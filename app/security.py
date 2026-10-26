@@ -115,7 +115,33 @@ def enforce_rate_limit(key: str) -> None:
         raise HTTPException(429, "Rate limit exceeded")
 
 
-def allow_database(db, key: str) -> bool:
+_DEV_SECRET_MARKERS = (
+    "development-change-me",
+    "development-change-me-too",
+    "replace-with-a-long-random",
+    "replace-me",
+    "correct-horse-battery",
+)
+
+
+def assert_production_configuration() -> None:
+    """Refuse to boot production with placeholder secrets or optional device trust."""
+    if os.environ.get("TIC_ENV", "development") != "production":
+        return
+    if not os.environ.get("TIC_DATA_KEY", "").strip():
+        raise RuntimeError("TIC_DATA_KEY is required when TIC_ENV=production")
+    if os.environ.get("TIC_REQUIRE_DEVICE_SIGNATURE", "1") != "1":
+        raise RuntimeError("Device signatures are required when TIC_ENV=production")
+    secrets = client_secrets()
+    if not secrets:
+        raise RuntimeError("TIC_CLIENT_SECRETS is required when TIC_ENV=production")
+    for secret in secrets.values():
+        lowered = secret.lower()
+        if len(secret) < 24 or any(marker in lowered for marker in _DEV_SECRET_MARKERS):
+            raise RuntimeError("Production client secrets must replace the development placeholders")
+
+
+def allow_database(db, key: str, limit: int | None = None, window: int | None = None) -> bool:
     """Shared counter. A second process reading the same database sees the same window."""
     from datetime import timedelta
 
@@ -124,8 +150,8 @@ def allow_database(db, key: str) -> bool:
     from .accounts import aware
     from .models import RateBucket, now
 
-    limit = int(os.environ.get("TIC_RATE_LIMIT", "600"))
-    window = int(os.environ.get("TIC_RATE_WINDOW", "60"))
+    limit = int(os.environ.get("TIC_RATE_LIMIT", "600") if limit is None else limit)
+    window = int(os.environ.get("TIC_RATE_WINDOW", "60") if window is None else window)
     current = now()
     query = select(RateBucket).where(RateBucket.key == key)
     if db.get_bind().dialect.name == "postgresql":

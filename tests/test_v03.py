@@ -44,8 +44,9 @@ def signed_event(event_id, product, event_type, subject, **overrides):
     ts = str(int(time.time()))
     signature = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
     headers = {"X-Event-Timestamp": ts, "X-Event-Signature": signature, "Content-Type": "application/json"}
-    if "nonce" in overrides:
-        headers["X-Event-Nonce"] = overrides["nonce"]
+    nonce = overrides.pop("nonce", event_id)
+    if nonce:
+        headers["X-Event-Nonce"] = nonce
     if "device_key" in overrides:
         headers["X-Device-Key-Id"] = overrides["device_key"]
         headers["X-Device-Signature"] = overrides["device_sig"]
@@ -90,6 +91,8 @@ def test_replay_nonce_and_spoofed_device_signature(monkeypatch):
     assert signed_event("v03-nonce-1", "guardian", "device.heartbeat", "nonce-person", nonce="n-1").status_code == 201
     replay = signed_event("v03-nonce-2", "guardian", "device.heartbeat", "nonce-person", nonce="n-1")
     assert replay.status_code == 409
+    missing_nonce = signed_event("v03-nonce-missing", "guardian", "device.heartbeat", "nonce-person", nonce="")
+    assert missing_nonce.status_code == 422
     monkeypatch.setenv(
         "TIC_DEVICE_KEYS",
         json.dumps({"tracker-1": {"secret": "device-secret-value", "tenant_id": "tenant-a", "product": "arxvigil"}}),
@@ -130,6 +133,7 @@ def test_replay_nonce_and_spoofed_device_signature(monkeypatch):
             "Content-Type": "application/json",
             "X-Event-Timestamp": ts,
             "X-Event-Signature": client_sig,
+            "X-Event-Nonce": "v03-signed-device",
             "X-Device-Key-Id": "tracker-1",
             "X-Device-Signature": device_sig,
         },
@@ -202,15 +206,28 @@ def test_governance_blocks_immobilisation_and_routes_do_not_expose_it():
 
 
 def enroll(organisation_id, email, password="correct-horse-battery"):
+    from app.totp import totp_code
+
     started = client.post(
         "/v1/auth/login",
         json={"organisation_id": organisation_id, "email": email, "password": password},
     )
-    assert started.status_code == 200
+    assert started.status_code == 200, started.text
     body = started.json()
-    assert body["mfa_enrollment_required"] is False
-    assert body["access_token"]
-    return body["access_token"]
+    if body.get("access_token"):
+        return body["access_token"]
+    assert body["mfa_enrollment_required"] is True
+    headers = {"Authorization": "Bearer " + body["enrollment_token"]}
+    enrolled = client.post("/v1/auth/mfa/enroll", headers=headers)
+    assert enrolled.status_code == 200, enrolled.text
+    confirmed = client.post(
+        "/v1/auth/mfa/confirm",
+        headers=headers,
+        json={"code": totp_code(enrolled.json()["secret"])},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert len(confirmed.json()["recovery_codes"]) == 8
+    return confirmed.json()["access_token"]
 
 
 def test_cross_tenant_user_cannot_read_other_organisation():
@@ -431,26 +448,41 @@ def test_login_ignores_surrounding_spaces_and_accepts_the_organisation_name():
     )
     assert response.status_code == 200
     assert response.json()["role"] == "supervisor"
-    assert response.json()["mfa_enrollment_required"] is False
-    assert response.json()["access_token"]
+    assert response.json()["mfa_enrollment_required"] is True
+    assert response.json()["access_token"] is None
 
 
-def test_stored_authenticator_does_not_block_sign_in():
+def test_stored_authenticator_requires_a_current_code():
+    from app.crypto import seal
+    from app.totp import random_secret, totp_code
+
     with SessionLocal() as db:
-        seed_demo_accounts(db)
+        create_user(db, "tenant-a", "mfa-user@example.com", "correct-horse-battery", "operator")
         from app.models import User
 
-        user = db.scalar(select(User).where(User.organisation_id == "demo", User.email == "operator@example.com"))
+        user = db.scalar(select(User).where(User.email == "mfa-user@example.com"))
+        secret = random_secret()
         user.mfa_enabled = True
-        user.mfa_secret = "enc:v1:not-a-real-ciphertext"
+        user.mfa_secret = seal(secret)
+        user.last_login_host = "10.1.1.1"
         db.commit()
-    response = client.post(
+    missing = client.post(
         "/v1/auth/login",
-        json={"organisation_id": "demo", "email": "operator@example.com", "password": "correct-horse-battery"},
+        json={"organisation_id": "tenant-a", "email": "mfa-user@example.com", "password": "correct-horse-battery"},
     )
-    assert response.status_code == 200
-    assert response.json()["access_token"]
-    assert response.json()["mfa_required"] is False
+    assert missing.status_code == 401
+    accepted = client.post(
+        "/v1/auth/login",
+        json={
+            "organisation_id": "tenant-a",
+            "email": "mfa-user@example.com",
+            "password": "correct-horse-battery",
+            "totp": totp_code(secret),
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["access_token"]
+    assert accepted.json()["security_alert"] == "Sign-in from a new client address."
 
 
 def test_demo_accounts_cover_each_human_role():
@@ -473,8 +505,9 @@ def test_demo_accounts_cover_each_human_role():
         body = response.json()
         assert body["role"] == role
         assert body["organisation_id"] == organisation_id
-        assert body["mfa_enrollment_required"] is False
-        assert body["access_token"]
+        assert body["mfa_enrollment_required"] is True
+        assert body["access_token"] is None
+        assert body["enrollment_token"]
     wrong_org = client.post(
         "/v1/auth/login",
         json={"organisation_id": "field", "email": "admin@example.com", "password": "correct-horse-battery"},
@@ -668,6 +701,84 @@ def test_developer_maintains_the_platform_without_dispatch():
     assert snapshot["live_dispatch"] is False
     assert snapshot["llm_enabled"] is False
     assert "does not immobilise" in snapshot["limits"]
+
+
+def test_lockout_recovery_reset_sessions_and_production_guards(monkeypatch):
+    from app.security import assert_production_configuration
+
+    with SessionLocal() as db:
+        create_user(db, "tenant-a", "lockout@example.com", "correct-horse-battery", "operator")
+        create_user(db, "tenant-a", "reset-admin@example.com", "correct-horse-battery", "administrator")
+        create_user(db, "tenant-a", "reset-target@example.com", "correct-horse-battery", "operator")
+        db.commit()
+    for _ in range(5):
+        failed = client.post(
+            "/v1/auth/login",
+            json={"organisation_id": "tenant-a", "email": "lockout@example.com", "password": "wrong-password-value"},
+        )
+        assert failed.status_code == 401
+    locked = client.post(
+        "/v1/auth/login",
+        json={"organisation_id": "tenant-a", "email": "lockout@example.com", "password": "correct-horse-battery"},
+    )
+    assert locked.status_code == 423
+    admin = enroll("tenant-a", "reset-admin@example.com")
+    headers = {"Authorization": "Bearer " + admin}
+    params = {"tenant_id": "tenant-a", "product": "guardian"}
+    people = client.get("/v1/users", params=params, headers=headers).json()
+    target = next(row for row in people if row["email"] == "reset-target@example.com")
+    issued = client.post("/v1/users/" + target["id"] + "/password-reset", params=params, headers=headers)
+    assert issued.status_code == 200
+    reset = client.post(
+        "/v1/auth/password/reset",
+        json={"token": issued.json()["reset_token"], "password": "replacement-battery"},
+    )
+    assert reset.status_code == 200
+    old = client.post(
+        "/v1/auth/login",
+        json={"organisation_id": "tenant-a", "email": "reset-target@example.com", "password": "correct-horse-battery"},
+    )
+    assert old.status_code == 401
+    sessions = client.get("/v1/auth/sessions", params=params, headers=headers)
+    assert sessions.status_code == 200
+    assert any(row["current"] for row in sessions.json())
+    others = client.post("/v1/auth/sessions/revoke-others", params=params, headers=headers)
+    assert others.status_code == 200
+    monkeypatch.setenv("TIC_ENV", "production")
+    monkeypatch.setenv("TIC_DATA_KEY", "production-data-key-value")
+    monkeypatch.setenv("TIC_CLIENT_SECRETS", json.dumps({"demo:guardian": "development-change-me"}))
+    try:
+        assert_production_configuration()
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised is True
+    monkeypatch.setenv("TIC_ENV", "development")
+    monkeypatch.setenv("TIC_REQUIRE_DEVICE_SIGNATURE", "1")
+    denied = signed_event("v03-device-required", "guardian", "device.heartbeat", "device-required")
+    assert denied.status_code == 401
+
+
+def test_tenant_isolation_covers_the_read_endpoints():
+    with SessionLocal() as db:
+        create_user(db, "tenant-b", "isolation@example.com", "correct-horse-battery", "operator")
+        db.commit()
+    token = enroll("tenant-b", "isolation@example.com")
+    headers = {"Authorization": "Bearer " + token}
+    paths = (
+        "/v1/incidents",
+        "/v1/evidence",
+        "/v1/devices",
+        "/v1/recommendations",
+        "/v1/audit",
+        "/v1/monitoring",
+        "/v1/auth/sessions",
+        "/v1/users",
+        "/v1/maintenance",
+    )
+    for path in paths:
+        response = client.get(path, params={"tenant_id": "tenant-a", "product": "guardian"}, headers=headers)
+        assert response.status_code == 403, path
 
 
 def test_shared_rate_limit_is_visible_to_another_session(monkeypatch):

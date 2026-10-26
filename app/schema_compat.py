@@ -14,6 +14,11 @@ def ensure_schema(engine) -> None:
         ("security_events", "delayed", _bool_ddl(engine, "delayed")),
         ("outbox", "claimed_by", "claimed_by VARCHAR(80)"),
         ("outbox", "claimed_at", "claimed_at TIMESTAMP"),
+        ("users", "recovery_hashes", "recovery_hashes TEXT"),
+        ("users", "failed_attempts", "failed_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("users", "locked_until", "locked_until TIMESTAMP"),
+        ("users", "last_login_host", "last_login_host VARCHAR(120)"),
+        ("sessions", "client_host", "client_host VARCHAR(120)"),
     ]
     inspector = inspect(engine)
     names = set(inspector.get_table_names())

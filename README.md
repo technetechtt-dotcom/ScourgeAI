@@ -30,7 +30,7 @@ pytest -q
 python scripts_demo.py
 ```
 
-Demo sign-in password for every account below is `correct-horse-battery`. Sign-in does not ask for an authenticator code.
+Demo sign-in password for every account below is `correct-horse-battery`. The first sign-in enrolls an authenticator and shows one-time recovery codes. Later sign-ins require that code or a recovery code. There is no email sender: an administrator or developer issues a password-reset token from the API.
 
 | Organisation | Email | Role |
 | --- | --- | --- |

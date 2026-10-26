@@ -16,23 +16,25 @@ from sqlalchemy.orm import Session
 
 from . import auditlog, ingest
 from .accounts import (
-    authenticate_password,
+    account_locked,
+    clear_login_failures,
+    consume_password_reset,
+    consume_recovery_code,
     create_user,
     ensure_organisation,
+    issue_password_reset,
+    issue_recovery_codes,
     issue_session,
+    list_sessions,
+    lookup_user,
+    register_login_failure,
+    revoke_session_id,
     revoke_token,
+    revoke_user_sessions,
     update_user,
     user_for_token,
 )
-from .authz import (
-    ACCOUNT_ROLES,
-    MAINTAINER_ROLES,
-    REVIEW_ROLES,
-    STATUS_ROLES,
-    Principal,
-    require,
-    resolve_principal,
-)
+from .authz import Principal, require_permission, resolve_principal
 from .copilot import answer_question, build_brief, handover_report
 from .db import SessionLocal, db_session, engine
 from .crypto import open_secret, seal
@@ -62,6 +64,7 @@ from .schemas import (
     LoginIn,
     MfaConfirmIn,
     ModelUpdateIn,
+    PasswordResetIn,
     QuestionIn,
     ReviewIn,
     SearchIn,
@@ -69,15 +72,17 @@ from .schemas import (
     UserCreateIn,
     UserUpdateIn,
 )
+from .security import allow_database, assert_production_configuration
 from .seed import register_model, seed_demo_accounts, seed_reference_data
 from .tenancy import TenantScope
 from .totp import random_secret, verify_totp
 from .worker import start_worker
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 HUMAN_ROLES = {"operator", "supervisor", "administrator", "developer"}
 ensure_schema(engine)
 configure_logging()
+assert_production_configuration()
 
 
 @asynccontextmanager
@@ -206,18 +211,86 @@ async def post_event(
 
 
 @app.post("/v1/auth/login")
-def login(body: LoginIn, db: Session = Depends(db_session)):
-    user = authenticate_password(db, body.organisation_id, body.email, body.password)
+def login(body: LoginIn, request: Request, db: Session = Depends(db_session)):
+    from .passwords import verify_password
+
+    host = request.client.host if request.client else "unknown"
+    attempt_key = f"login:{body.organisation_id.strip().lower()}:{body.email.strip().lower()}"
+    if not allow_database(db, attempt_key, limit=10, window=900):
+        db.commit()
+        raise HTTPException(429, "Too many sign-in attempts. Try again later.")
+    user = lookup_user(db, body.organisation_id, body.email)
     if user is None:
+        db.commit()
         raise HTTPException(401, "No account matches that organisation, email, and password.")
-    token = issue_session(db, user, scope="full")
+    if account_locked(user):
+        db.commit()
+        raise HTTPException(423, "This account is temporarily locked.")
+    if not verify_password(body.password, user.password_hash):
+        register_login_failure(user)
+        auditlog.record(
+            db,
+            tenant_id=user.organisation_id,
+            actor=user.email,
+            action="LOGIN_FAILED",
+            subject=user.id,
+            data={"client_host": host},
+        )
+        db.commit()
+        raise HTTPException(401, "No account matches that organisation, email, and password.")
+    clear_login_failures(user)
+    if not user.mfa_enabled:
+        token = issue_session(db, user, scope="mfa_enroll", client_host=host)
+        auditlog.record(
+            db,
+            tenant_id=user.organisation_id,
+            actor=user.email,
+            action="LOGIN_MFA_ENROLL",
+            subject=user.id,
+            data={"role": user.role},
+        )
+        db.commit()
+        return {
+            "access_token": None,
+            "enrollment_token": token,
+            "mfa_enrollment_required": True,
+            "mfa_required": False,
+            "role": user.role,
+            "organisation_id": user.organisation_id,
+            "security_alert": None,
+        }
+    used_recovery = False
+    if body.recovery_code:
+        if not consume_recovery_code(user, body.recovery_code):
+            register_login_failure(user)
+            db.commit()
+            raise HTTPException(401, "Invalid recovery code")
+        used_recovery = True
+    elif not verify_totp(open_secret(user.mfa_secret), body.totp):
+        register_login_failure(user)
+        db.commit()
+        detail = "Authenticator code required." if not body.totp else "Invalid MFA code"
+        raise HTTPException(401, detail)
+    alert = None
+    if user.last_login_host and user.last_login_host != host:
+        alert = "Sign-in from a new client address."
+        auditlog.record(
+            db,
+            tenant_id=user.organisation_id,
+            actor=user.email,
+            action="SUSPICIOUS_LOGIN",
+            subject=user.id,
+            data={"previous_host": user.last_login_host, "client_host": host},
+        )
+    user.last_login_host = host
+    token = issue_session(db, user, scope="full", client_host=host)
     auditlog.record(
         db,
         tenant_id=user.organisation_id,
         actor=user.email,
         action="LOGIN",
         subject=user.id,
-        data={"role": user.role, "mfa": False},
+        data={"role": user.role, "mfa": True, "recovery_code": used_recovery, "client_host": host},
     )
     db.commit()
     return {
@@ -227,6 +300,7 @@ def login(body: LoginIn, db: Session = Depends(db_session)):
         "mfa_required": False,
         "role": user.role,
         "organisation_id": user.organisation_id,
+        "security_alert": alert,
     }
 
 
@@ -263,6 +337,7 @@ def mfa_confirm(body: MfaConfirmIn, db: Session = Depends(db_session), authoriza
     if not user.mfa_secret or not verify_totp(open_secret(user.mfa_secret), body.code):
         raise HTTPException(401, "Invalid MFA code")
     user.mfa_enabled = True
+    codes = issue_recovery_codes(user)
     raw = authorization.split(" ", 1)[1].strip() if authorization else ""
     revoke_token(db, raw)
     token = issue_session(db, user, scope="full")
@@ -272,10 +347,10 @@ def mfa_confirm(body: MfaConfirmIn, db: Session = Depends(db_session), authoriza
         actor=user.email,
         action="MFA_ENABLED",
         subject=user.id,
-        data={"role": user.role},
+        data={"role": user.role, "recovery_codes": len(codes)},
     )
     db.commit()
-    return {"access_token": token, "mfa_enabled": True, "role": user.role}
+    return {"access_token": token, "mfa_enabled": True, "role": user.role, "recovery_codes": codes}
 
 
 @app.post("/v1/auth/logout")
@@ -288,6 +363,73 @@ def logout(
     revoke_token(db, authorization.split(" ", 1)[1].strip())
     db.commit()
     return {"revoked": True}
+
+
+def _bearer(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Unauthorized")
+    return authorization.split(" ", 1)[1].strip()
+
+
+@app.get("/v1/auth/sessions")
+def sessions(caller: Principal = Depends(principal), db: Session = Depends(db_session), authorization: str | None = Header(None)):
+    if caller.user_id is None:
+        raise HTTPException(403, "Forbidden")
+    return list_sessions(db, caller.user_id, _bearer(authorization))
+
+
+@app.post("/v1/auth/sessions/{session_id}/revoke")
+def revoke_session(
+    session_id: str,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    if caller.user_id is None or not revoke_session_id(db, session_id, caller.user_id):
+        raise HTTPException(404, "Not found")
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        actor=caller.actor,
+        action="SESSION_REVOKED",
+        subject=session_id,
+        data={},
+    )
+    db.commit()
+    return {"revoked": True}
+
+
+@app.post("/v1/auth/sessions/revoke-others")
+def revoke_other_sessions(
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+    authorization: str | None = Header(None),
+):
+    if caller.user_id is None:
+        raise HTTPException(403, "Forbidden")
+    raw = _bearer(authorization)
+    import hashlib
+
+    kept = hashlib.sha256(raw.encode()).hexdigest()
+    count = revoke_user_sessions(db, caller.user_id, keep_hash=kept)
+    db.commit()
+    return {"revoked": count}
+
+
+@app.post("/v1/auth/password/reset")
+def reset_password(body: PasswordResetIn, db: Session = Depends(db_session)):
+    user = consume_password_reset(db, body.token, body.password)
+    if user is None:
+        raise HTTPException(401, "Invalid or expired reset token")
+    auditlog.record(
+        db,
+        tenant_id=user.organisation_id,
+        actor=user.email,
+        action="PASSWORD_RESET",
+        subject=user.id,
+        data={},
+    )
+    db.commit()
+    return {"reset": True}
 
 
 @app.get("/v1/auth/me")
@@ -303,7 +445,7 @@ def me(caller: Principal = Depends(principal)):
 
 @app.get("/v1/organisations")
 def organisation(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, "administrator", "supervisor", "operator", "developer", "service")
+    require_permission(caller, "records.read")
     org = ensure_organisation(db, caller.tenant_id)
     db.commit()
     return {"id": org.id, "name": org.name}
@@ -311,7 +453,7 @@ def organisation(caller: Principal = Depends(principal), db: Session = Depends(d
 
 @app.get("/v1/users")
 def users(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *ACCOUNT_ROLES)
+    require_permission(caller, "users.manage")
     rows = list(db.scalars(select(User).where(User.organisation_id == caller.tenant_id).order_by(User.email)))
     return [
         {"id": row.id, "email": row.email, "role": row.role, "mfa_enabled": row.mfa_enabled, "disabled": row.disabled}
@@ -321,7 +463,7 @@ def users(caller: Principal = Depends(principal), db: Session = Depends(db_sessi
 
 @app.post("/v1/users", status_code=201)
 def add_user(body: UserCreateIn, caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *ACCOUNT_ROLES)
+    require_permission(caller, "users.manage")
     if caller.method != "bearer":
         raise HTTPException(403, "Forbidden")
     try:
@@ -347,7 +489,7 @@ def change_user(
     caller: Principal = Depends(principal),
     db: Session = Depends(db_session),
 ):
-    require(caller, *ACCOUNT_ROLES)
+    require_permission(caller, "users.manage")
     if caller.method != "bearer":
         raise HTTPException(403, "Forbidden")
     if body.role is None and body.disabled is None:
@@ -373,6 +515,31 @@ def change_user(
     )
     db.commit()
     return {"id": user.id, "email": user.email, "role": user.role, "disabled": user.disabled}
+
+
+@app.post("/v1/users/{user_id}/password-reset")
+def create_password_reset(
+    user_id: str,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    require_permission(caller, "users.manage")
+    if caller.method != "bearer":
+        raise HTTPException(403, "Forbidden")
+    user = db.get(User, user_id)
+    if user is None or user.organisation_id != caller.tenant_id:
+        raise HTTPException(404, "Not found")
+    token = issue_password_reset(db, user)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        actor=caller.actor,
+        action="PASSWORD_RESET_ISSUED",
+        subject=user.id,
+        data={},
+    )
+    db.commit()
+    return {"reset_token": token, "expires_in": 3600}
 
 
 @app.get("/v1/incidents")
@@ -451,7 +618,7 @@ def incident_status(
     caller: Principal = Depends(principal),
     db: Session = Depends(db_session),
 ):
-    require(caller, *STATUS_ROLES)
+    require_permission(caller, "incidents.update")
     incident = TenantScope(db, caller.tenant_id, caller.product).incident(incident_id)
     if incident is None:
         raise HTTPException(404, "Not found")
@@ -476,7 +643,7 @@ def review(
     caller: Principal = Depends(principal),
     db: Session = Depends(db_session),
 ):
-    require(caller, *REVIEW_ROLES)
+    require_permission(caller, "recommendations.review")
     row = db.get(Recommendation, recommendation_id)
     if row is None or row.tenant_id != caller.tenant_id:
         raise HTTPException(404, "Not found")
@@ -795,7 +962,7 @@ def divergence(subject_id: str, caller: Principal = Depends(principal), db: Sess
 
 @app.post("/v1/grants", status_code=201)
 def grant(body: GrantIn, caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *ACCOUNT_ROLES)
+    require_permission(caller, "users.manage")
     if body.from_product == body.to_product:
         raise HTTPException(422, "Grant must cross products")
     row = CrossDomainGrant(
@@ -848,13 +1015,13 @@ def _maintenance_snapshot(db: Session, caller: Principal) -> dict:
 
 @app.get("/v1/maintenance")
 def maintenance(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *MAINTAINER_ROLES)
+    require_permission(caller, "platform.maintain")
     return _maintenance_snapshot(db, caller)
 
 
 @app.post("/v1/maintenance/catalogue")
 def refresh_catalogue(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *MAINTAINER_ROLES)
+    require_permission(caller, "platform.maintain")
     created = seed_reference_data(db)
     auditlog.record(
         db,
@@ -871,7 +1038,7 @@ def refresh_catalogue(caller: Principal = Depends(principal), db: Session = Depe
 
 @app.post("/v1/maintenance/requeue")
 def requeue(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *MAINTAINER_ROLES)
+    require_permission(caller, "platform.maintain")
     count = requeue_dead(db, caller.tenant_id)
     auditlog.record(
         db,
@@ -888,7 +1055,7 @@ def requeue(caller: Principal = Depends(principal), db: Session = Depends(db_ses
 
 @app.post("/v1/maintenance/models")
 def update_model(body: ModelUpdateIn, caller: Principal = Depends(principal), db: Session = Depends(db_session)):
-    require(caller, *MAINTAINER_ROLES)
+    require_permission(caller, "platform.maintain")
     row, created = register_model(db, body.name, body.version, body.kind, body.status, body.description)
     auditlog.record(
         db,

@@ -90,3 +90,14 @@ ACCOUNT_ROLES = ("administrator", "developer")
 REVIEW_ROLES = ("service", "supervisor", "administrator", "developer")
 STATUS_ROLES = ("supervisor", "administrator", "developer")
 MAINTAINER_ROLES = ("developer",)
+PERMISSIONS = {
+    "records.read": ("administrator", "supervisor", "operator", "developer", "service"),
+    "users.manage": ACCOUNT_ROLES,
+    "incidents.update": STATUS_ROLES,
+    "recommendations.review": REVIEW_ROLES,
+    "platform.maintain": MAINTAINER_ROLES,
+}
+
+
+def require_permission(principal: Principal, permission: str) -> None:
+    require(principal, *PERMISSIONS[permission])

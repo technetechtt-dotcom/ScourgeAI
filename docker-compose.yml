@@ -1,3 +1,4 @@
+# Development only. These passwords and client secrets are refused when TIC_ENV=production.
 services:
   db:
     image: postgres:16

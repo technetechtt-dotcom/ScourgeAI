@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+
+- Require authenticator enrollment before a full session, and issue one-time recovery codes.
+- Lock an account after five failed sign-ins, record a new client address, and let a user revoke other sessions.
+- Let an administrator or developer issue a one-time password reset token. There is no email delivery.
+- Require an event nonce. Production startup rejects development client secrets and unsigned device telemetry.
+- Name the existing role gates as permissions. This is not a separate policy engine.
+
 ## 0.3.1
 - Seal MFA secrets before they are stored, and require TOTP for operators as well as supervisors and administrators.
 - Record recommendation reviews as the authenticated principal. A client-secret caller is `client:{product}`.
