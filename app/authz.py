@@ -96,6 +96,7 @@ PERMISSIONS = {
     "incidents.update": STATUS_ROLES,
     "recommendations.review": REVIEW_ROLES,
     "platform.maintain": MAINTAINER_ROLES,
+    "security.monitor": ("supervisor", "administrator", "developer"),
 }
 
 

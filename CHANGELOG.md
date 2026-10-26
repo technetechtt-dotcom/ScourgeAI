@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- An administrator or developer must enter their own password before resetting another user's authenticator. That reset revokes the user's sessions.
+- A user manager can remotely end another user's sessions.
+- Device HMAC credentials can be issued, rotated, and revoked in the database. The secret is sealed and shown once. A managed credential enforces an increasing event sequence.
+- Supervisors, administrators, and developers can read privileged security alerts.
+
 ## 0.3.2
 
 - Require authenticator enrollment before a full session, and issue one-time recovery codes.

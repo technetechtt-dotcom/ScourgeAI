@@ -45,6 +45,7 @@ def ingest_event(
     nonce: str | None,
     device_key_id: str | None,
     device_signature: str | None,
+    sequence: str | None,
     client_host: str,
 ) -> dict:
     if len(body) > 65536:
@@ -57,8 +58,19 @@ def ingest_event(
     authenticate_client(body, event.tenant_id, event.source_product, timestamp, signature)
     if not validate_adapter(event):
         raise HTTPException(422, "Unsupported product event type")
+    managed_secret = None
+    credential = None
+    if device_key_id:
+        managed_secret, credential = devices.managed_device_secret(
+            db, device_key_id, event.tenant_id, event.source_product
+        )
     device_verified = verify_device_signature(
-        body, event.tenant_id, event.source_product, device_key_id, device_signature
+        body,
+        event.tenant_id,
+        event.source_product,
+        device_key_id,
+        device_signature,
+        managed_secret=managed_secret,
     )
     if event.source.signature_verified and not device_verified:
         raise HTTPException(422, "Invalid provenance claim")
@@ -92,6 +104,10 @@ def ingest_event(
                 )
         except IntegrityError as exc:
             raise HTTPException(409, "Replay detected") from exc
+    if sequence and credential is None:
+        raise HTTPException(422, "Sequence requires a managed device credential")
+    if credential is not None:
+        devices.accept_sequence(credential, sequence)
     ensure_organisation(db, event.tenant_id)
     emergency = event.event_type in engine.SOS_EVENTS
     scope = (

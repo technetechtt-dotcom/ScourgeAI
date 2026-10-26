@@ -1,4 +1,4 @@
-# Development status — version 0.3.2
+# Development status — version 0.3.3
 
 This file is the implementation record. It is not a production-readiness claim. The service does not dispatch responders, immobilise vehicles, or call a language model.
 
@@ -25,7 +25,7 @@ Version 0.2 already had signed ingestion, idempotent event IDs, tenant/product r
 | Review identity | Completed for this API | The stored reviewer is the authenticated principal. A client-secret review is `client:{product}` even if the body supplies another name. |
 | Rate limit | Partial | The request path stores hits in `rate_buckets`, and a second database session sees the same count. It is not a separate broker, and the window is not shared with a process that uses another database. |
 | Replay protection | Partial | `X-Event-Nonce` is optional so old clients still work. Reuse of a nonce with a new event returns 409. Re-delivery of the same event ID stays idempotent. |
-| Device signatures | Partial | Optional `X-Device-Key-Id` and `X-Device-Signature` over the raw body. Keys live in `TIC_DEVICE_KEYS`. A client claim of `signature_verified` without a matching key is rejected. Unsigned events remain unverified client claims. |
+| Device signatures | Partial | Optional `X-Device-Key-Id` and `X-Device-Signature` over the raw body. A developer can issue, rotate, and revoke a sealed device credential in the database. The plaintext secret is returned once. A managed credential rejects a repeated or lower `X-Event-Sequence`. Environment keys in `TIC_DEVICE_KEYS` still work for development. This is HMAC provenance, not an X.509 certificate authority. A client claim of `signature_verified` without a matching key is rejected. Unsigned events remain unverified client claims unless production or `TIC_REQUIRE_DEVICE_SIGNATURE=1` is set. |
 | Audit | Completed for application events | Ingestion, login, MFA, review, questions, user creation, user updates, grants, status changes, catalogue refresh, model updates, and dead-letter requeue append audit rows. There is no external immutable log or legal hold. |
 | Agents | Completed as deterministic code | Eight agents: threat intelligence, incident copilot, guardian safety, ArxVigil vehicle trust, evidence intelligence, search and location, operations intelligence, AI governance. Each has responsibilities, schemas, tool lists, forbidden actions, confidence, uncertainty, and an execution row. They do not receive a database session. |
 | Language model | Unimplemented by decision | `app.llm.complete` raises `LLMDisabled`. No provider is called, including when a caller passes evidence identifiers. `llm_enabled` stays false. |

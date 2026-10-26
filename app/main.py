@@ -60,7 +60,9 @@ from .models import (
 from .schema_compat import ensure_schema
 from .outbox import requeue_dead
 from .schemas import (
+    DeviceCredentialIn,
     GrantIn,
+    IdentityCheckIn,
     LoginIn,
     MfaConfirmIn,
     ModelUpdateIn,
@@ -78,7 +80,7 @@ from .tenancy import TenantScope
 from .totp import random_secret, verify_totp
 from .worker import start_worker
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 HUMAN_ROLES = {"operator", "supervisor", "administrator", "developer"}
 ensure_schema(engine)
 configure_logging()
@@ -195,6 +197,7 @@ async def post_event(
     x_event_nonce: str | None = Header(None),
     x_device_key_id: str | None = Header(None),
     x_device_signature: str | None = Header(None),
+    x_event_sequence: str | None = Header(None),
 ):
     host = request.client.host if request.client else "unknown"
     body = await request.body()
@@ -206,6 +209,7 @@ async def post_event(
         nonce=x_event_nonce,
         device_key_id=x_device_key_id,
         device_signature=x_device_signature,
+        sequence=x_event_sequence,
         client_host=host,
     )
 
@@ -540,6 +544,162 @@ def create_password_reset(
     )
     db.commit()
     return {"reset_token": token, "expires_in": 3600}
+
+
+@app.post("/v1/users/{user_id}/mfa-reset")
+def reset_mfa(
+    user_id: str,
+    body: IdentityCheckIn,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    from .passwords import verify_password
+
+    require_permission(caller, "users.manage")
+    if caller.method != "bearer" or caller.user_id is None:
+        raise HTTPException(403, "Forbidden")
+    actor = db.get(User, caller.user_id)
+    if actor is None or not verify_password(body.password, actor.password_hash):
+        raise HTTPException(401, "Administrator password does not match")
+    user = db.get(User, user_id)
+    if user is None or user.organisation_id != caller.tenant_id:
+        raise HTTPException(404, "Not found")
+    user.mfa_enabled = False
+    user.mfa_secret = None
+    user.recovery_hashes = None
+    clear_login_failures(user)
+    revoke_user_sessions(db, user.id)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        actor=caller.actor,
+        action="MFA_RESET",
+        subject=user.id,
+        data={"verified_by_password": True},
+    )
+    db.commit()
+    return {"mfa_enabled": False, "sessions_revoked": True}
+
+
+@app.post("/v1/users/{user_id}/sessions/revoke")
+def revoke_user_remote(
+    user_id: str,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    require_permission(caller, "users.manage")
+    if caller.method != "bearer":
+        raise HTTPException(403, "Forbidden")
+    user = db.get(User, user_id)
+    if user is None or user.organisation_id != caller.tenant_id:
+        raise HTTPException(404, "Not found")
+    count = revoke_user_sessions(db, user.id)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        actor=caller.actor,
+        action="REMOTE_LOGOUT",
+        subject=user.id,
+        data={"revoked": count},
+    )
+    db.commit()
+    return {"revoked": count}
+
+
+@app.get("/v1/security/alerts")
+def security_alerts(caller: Principal = Depends(principal), db: Session = Depends(db_session)):
+    require_permission(caller, "security.monitor")
+    actions = ("SUSPICIOUS_LOGIN", "LOGIN_FAILED", "MFA_RESET", "PASSWORD_RESET_ISSUED", "PASSWORD_RESET", "REMOTE_LOGOUT", "SESSION_REVOKED", "DEVICE_REVOKED")
+    rows = list(
+        db.scalars(
+            select(Audit)
+            .where(Audit.tenant_id == caller.tenant_id, Audit.action.in_(actions))
+            .order_by(Audit.created_at.desc())
+            .limit(100)
+        )
+    )
+    return [
+        {
+            "id": row.id,
+            "actor": row.actor,
+            "action": row.action,
+            "subject": row.subject,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "data": row.data,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/v1/devices/credentials", status_code=201)
+def create_device_credential(
+    body: DeviceCredentialIn,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    from .devices import issue_device_credential
+
+    require_permission(caller, "platform.maintain")
+    if caller.method != "bearer":
+        raise HTTPException(403, "Forbidden")
+    row, secret = issue_device_credential(db, caller.tenant_id, body.product, body.device_id)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        product=body.product,
+        actor=caller.actor,
+        action="DEVICE_CREDENTIAL_ISSUED",
+        subject=row.id,
+        data={"status": row.status},
+    )
+    db.commit()
+    return {"device_id": row.id, "product": row.product, "secret": secret, "status": row.status}
+
+
+@app.post("/v1/devices/credentials/{device_id}/rotate")
+def rotate_credential(
+    device_id: str,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    from .devices import rotate_device_credential
+
+    require_permission(caller, "platform.maintain")
+    row, secret = rotate_device_credential(db, caller.tenant_id, device_id)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        product=row.product,
+        actor=caller.actor,
+        action="DEVICE_CREDENTIAL_ROTATED",
+        subject=row.id,
+        data={},
+    )
+    db.commit()
+    return {"device_id": row.id, "secret": secret, "status": row.status}
+
+
+@app.post("/v1/devices/credentials/{device_id}/revoke")
+def revoke_credential(
+    device_id: str,
+    caller: Principal = Depends(principal),
+    db: Session = Depends(db_session),
+):
+    from .devices import revoke_device_credential
+
+    require_permission(caller, "platform.maintain")
+    row = revoke_device_credential(db, caller.tenant_id, device_id)
+    auditlog.record(
+        db,
+        tenant_id=caller.tenant_id,
+        product=row.product,
+        actor=caller.actor,
+        action="DEVICE_REVOKED",
+        subject=row.id,
+        data={},
+    )
+    db.commit()
+    return {"device_id": row.id, "status": row.status}
 
 
 @app.get("/v1/incidents")

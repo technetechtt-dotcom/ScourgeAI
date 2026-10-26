@@ -85,6 +85,21 @@ class PasswordReset(Base):
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
 
+class DeviceCredential(Base):
+    """Managed device HMAC credential. The secret is sealed. The plaintext is returned once."""
+
+    __tablename__ = "device_credentials"
+    id = Column(String(120), primary_key=True)
+    tenant_id = Column(String(120), nullable=False, index=True)
+    product = Column(String(32), nullable=False)
+    status = Column(String(24), nullable=False, default="active")
+    secret_sealed = Column(Text, nullable=False)
+    last_sequence = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=now, nullable=False)
+    rotated_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class EventNonce(Base):
     __tablename__ = "event_nonces"
     id = Column(String(60), primary_key=True)

@@ -47,6 +47,8 @@ def signed_event(event_id, product, event_type, subject, **overrides):
     nonce = overrides.pop("nonce", event_id)
     if nonce:
         headers["X-Event-Nonce"] = nonce
+    if "sequence" in overrides:
+        headers["X-Event-Sequence"] = str(overrides["sequence"])
     if "device_key" in overrides:
         headers["X-Device-Key-Id"] = overrides["device_key"]
         headers["X-Device-Signature"] = overrides["device_sig"]
@@ -779,6 +781,142 @@ def test_tenant_isolation_covers_the_read_endpoints():
     for path in paths:
         response = client.get(path, params={"tenant_id": "tenant-a", "product": "guardian"}, headers=headers)
         assert response.status_code == 403, path
+
+
+def test_mfa_reset_remote_logout_and_managed_device_credentials():
+    with SessionLocal() as db:
+        create_user(db, "tenant-a", "cred-admin@example.com", "correct-horse-battery", "administrator")
+        create_user(db, "tenant-a", "cred-dev@example.com", "correct-horse-battery", "developer")
+        create_user(db, "tenant-a", "cred-op@example.com", "correct-horse-battery", "operator")
+        db.commit()
+    admin = enroll("tenant-a", "cred-admin@example.com")
+    operator = enroll("tenant-a", "cred-op@example.com")
+    developer = enroll("tenant-a", "cred-dev@example.com")
+    params = {"tenant_id": "tenant-a", "product": "guardian"}
+    admin_headers = {"Authorization": "Bearer " + admin}
+    operator_headers = {"Authorization": "Bearer " + operator}
+    developer_headers = {"Authorization": "Bearer " + developer}
+    people = client.get("/v1/users", params=params, headers=admin_headers).json()
+    operator_id = next(row["id"] for row in people if row["email"] == "cred-op@example.com")
+    forbidden = client.post(
+        "/v1/users/" + operator_id + "/mfa-reset",
+        params=params,
+        headers=operator_headers,
+        json={"password": "correct-horse-battery"},
+    )
+    assert forbidden.status_code == 403
+    wrong = client.post(
+        "/v1/users/" + operator_id + "/mfa-reset",
+        params=params,
+        headers=admin_headers,
+        json={"password": "wrong-password-value"},
+    )
+    assert wrong.status_code == 401
+    reset = client.post(
+        "/v1/users/" + operator_id + "/mfa-reset",
+        params=params,
+        headers=admin_headers,
+        json={"password": "correct-horse-battery"},
+    )
+    assert reset.status_code == 200
+    assert reset.json()["sessions_revoked"] is True
+    assert client.get("/v1/auth/me", params=params, headers=operator_headers).status_code == 401
+    operator = enroll("tenant-a", "cred-op@example.com")
+    operator_headers = {"Authorization": "Bearer " + operator}
+    assert client.get("/v1/security/alerts", params=params, headers=operator_headers).status_code == 403
+    remote = client.post("/v1/users/" + operator_id + "/sessions/revoke", params=params, headers=admin_headers)
+    assert remote.status_code == 200
+    assert remote.json()["revoked"] >= 1
+    assert client.get("/v1/auth/me", params=params, headers=operator_headers).status_code == 401
+    alerts = client.get("/v1/security/alerts", params=params, headers=admin_headers)
+    assert alerts.status_code == 200
+    assert any(row["action"] == "MFA_RESET" for row in alerts.json())
+    assert client.post(
+        "/v1/devices/credentials",
+        params=params,
+        headers=admin_headers,
+        json={"device_id": "tracker-managed", "product": "guardian"},
+    ).status_code == 403
+    issued = client.post(
+        "/v1/devices/credentials",
+        params=params,
+        headers=developer_headers,
+        json={"device_id": "tracker-managed", "product": "guardian"},
+    )
+    assert issued.status_code == 201
+    secret = issued.json()["secret"]
+
+    def send_managed(event_id, sequence, device_secret):
+        data = {
+            "schema_version": "1.0",
+            "event_id": event_id,
+            "event_type": "device.heartbeat",
+            "source_product": "guardian",
+            "tenant_id": "tenant-a",
+            "subject_type": "person",
+            "subject_id": "managed-device-person",
+            "occurred_at": "2026-10-22T12:00:00Z",
+            "source": {"device_id": "tracker-managed"},
+            "observation": {},
+            "integrity": {},
+        }
+        body = json.dumps(data, separators=(",", ":")).encode()
+        stamp = str(int(time.time()))
+        client_sig = hmac.new(b"secret-guardian", stamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+        device_sig = hmac.new(device_secret.encode(), body, hashlib.sha256).hexdigest()
+        return client.post(
+            "/v1/events",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Event-Timestamp": stamp,
+                "X-Event-Signature": client_sig,
+                "X-Event-Nonce": event_id,
+                "X-Event-Sequence": str(sequence),
+                "X-Device-Key-Id": "tracker-managed",
+                "X-Device-Signature": device_sig,
+            },
+        )
+
+    assert send_managed("cred-seq-1", 1, secret).status_code == 201
+    assert send_managed("cred-seq-replay", 1, secret).status_code == 409
+    assert send_managed("cred-seq-2", 2, secret).status_code == 201
+    rotated = client.post("/v1/devices/credentials/tracker-managed/rotate", params=params, headers=developer_headers)
+    assert rotated.status_code == 200
+    assert send_managed("cred-seq-old", 3, secret).status_code == 401
+    assert send_managed("cred-seq-3", 3, rotated.json()["secret"]).status_code == 201
+    revoked = client.post("/v1/devices/credentials/tracker-managed/revoke", params=params, headers=developer_headers)
+    assert revoked.status_code == 200
+    assert send_managed("cred-seq-4", 4, rotated.json()["secret"]).status_code == 401
+    stale_body = json.dumps(
+        {
+            "schema_version": "1.0",
+            "event_id": "cred-stale",
+            "event_type": "device.heartbeat",
+            "source_product": "guardian",
+            "tenant_id": "tenant-a",
+            "subject_type": "person",
+            "subject_id": "stale-person",
+            "occurred_at": "2026-10-22T12:00:00Z",
+            "source": {},
+            "observation": {},
+            "integrity": {},
+        },
+        separators=(",", ":"),
+    ).encode()
+    stale_stamp = str(int(time.time()) - 600)
+    stale_sig = hmac.new(b"secret-guardian", stale_stamp.encode() + b"." + stale_body, hashlib.sha256).hexdigest()
+    stale = client.post(
+        "/v1/events",
+        content=stale_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Event-Timestamp": stale_stamp,
+            "X-Event-Signature": stale_sig,
+            "X-Event-Nonce": "cred-stale",
+        },
+    )
+    assert stale.status_code == 401
 
 
 def test_shared_rate_limit_is_visible_to_another_session(monkeypatch):

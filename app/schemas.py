@@ -53,6 +53,15 @@ class MfaConfirmIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
     code: str = Field(min_length=6, max_length=6)
 
+class IdentityCheckIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    password: str = Field(min_length=12, max_length=200)
+
+class DeviceCredentialIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    device_id: str = Field(min_length=2, max_length=120)
+    product: Literal['guardian','arxvigil']
+
 class PasswordResetIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
     token: str = Field(min_length=20, max_length=200)

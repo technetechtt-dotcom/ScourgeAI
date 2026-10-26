@@ -62,18 +62,21 @@ def verify_device_signature(
     product: str,
     key_id: str | None,
     signature: str | None,
+    managed_secret: str | None = None,
 ) -> bool:
-    """Return True only when a configured device key matches this exact body."""
+    """Return True only when a managed credential or configured device key matches this exact body."""
     if not key_id and not signature:
         return False
     if not key_id or not signature:
         raise HTTPException(401, "Incomplete device signature")
-    record = device_keys().get(key_id)
-    if not isinstance(record, dict):
-        raise HTTPException(401, "Unknown device key")
-    if record.get("tenant_id") != tenant or record.get("product") != product:
-        raise HTTPException(401, "Device key is not valid for this tenant")
-    secret = record.get("secret")
+    secret = managed_secret
+    if secret is None:
+        record = device_keys().get(key_id)
+        if not isinstance(record, dict):
+            raise HTTPException(401, "Unknown device key")
+        if record.get("tenant_id") != tenant or record.get("product") != product:
+            raise HTTPException(401, "Device key is not valid for this tenant")
+        secret = record.get("secret")
     if not isinstance(secret, str) or not secret:
         raise HTTPException(401, "Unknown device key")
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
